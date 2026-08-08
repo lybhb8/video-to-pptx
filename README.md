@@ -33,12 +33,18 @@ python scripts/video_to_pptx.py input.mp4 output.pptx --interval 2 --similarity 
 | `--similarity` | 0.92 | perceptual hash threshold; raise to keep fewer similar frames |
 | `--ocr` | paddleocr | `paddleocr` or `easyocr` |
 | `--keep-frames` | off | keep extracted frame images |
+| `--crop-top/bottom/left/right` | 0 | fractions of the frame to ignore during dedup (overlay removal: title bars, taskbar, player controls) |
+| `--text-similarity` | 0 (off) | merge slides whose OCR text similarity ≥ this; "same main content => duplicate" |
+| `--min-text-height` | 0.02 | drop OCR lines smaller than this fraction of frame height (removes menus / title bars / watermark text); 0 keeps all |
+| `--text-top` / `--text-bottom` | 0 | ignore these fractions of frame height at top/bottom when keeping OCR text (ribbon / taskbar / watermark overlay removal) |
 
 ## Tuning
 
 - Too many duplicate slides → raise `--similarity` to 0.95+
 - Missing slides → lower `--similarity` to 0.85–0.88 or reduce `--interval`
 - Animated transitions / camera movement → use `--interval 5` first to preview
+- Screen recordings with fixed overlays (taskbar / title bars / watermark) → pass `--crop-top` / `--crop-bottom` to ignore those strips when judging duplicates
+- Slides that differ only by cursor movement or tiny UI changes → enable `--text-similarity 0.9` to merge pages whose main content (OCR text) is the same
 
 ## Install as Claude Code skill
 

@@ -63,10 +63,13 @@ Steps:
 
 Usage:
   python ~/.claude/scripts/video_to_pptx.py input.mp4 output.pptx \
-      --interval 2 --similarity 0.92
+      --interval 2 --similarity 0.92 --ocr easyocr \
+      --crop-top 0.05 --crop-bottom 0.06 --text-similarity 0.9
 """
 import argparse
+import difflib
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -97,8 +100,20 @@ def extract_frames(video_path: Path, out_dir: Path, interval_sec: float):
     return sorted(out_dir.glob("frame_*.jpg"))
 
 
-def image_hash(path: Path, size: int = 16) -> str:
-    img = Image.open(path).convert("L").resize((size, size), Image.Resampling.LANCZOS)
+def image_hash(path: Path, size: int = 16, crop=None) -> str:
+    """Perceptual hash. `crop` is (top, bottom, left, right) fractions of the
+    image to ignore before hashing — used to remove overlay regions such as
+    title bars, taskbars or player controls from the comparison."""
+    img = Image.open(path).convert("L")
+    if crop:
+        w, h = img.size
+        top, bottom, left, right = crop
+        box = (
+            int(w * left), int(h * top),
+            int(w * (1 - right)), int(h * (1 - bottom)),
+        )
+        img = img.crop(box)
+    img = img.resize((size, size), Image.Resampling.LANCZOS)
     arr = np.array(img, dtype=np.float32)
     mean = arr.mean()
     bits = (arr > mean).astype(np.uint8)
@@ -112,15 +127,39 @@ def hash_similarity(a: str, b: str) -> float:
     return 1 - dist / 160.0
 
 
-def deduplicate(frame_paths, threshold: float):
+def deduplicate(frame_paths, threshold: float, crop=None):
     kept, hashes = [], []
     for p in frame_paths:
-        h = image_hash(p)
+        h = image_hash(p, crop=crop)
         if any(hash_similarity(h, e) >= threshold for e in hashes):
             continue
         kept.append(p)
         hashes.append(h)
     return kept
+
+
+def text_similarity(a: str, b: str) -> float:
+    """0-1 similarity of two OCR text blocks, whitespace-insensitive."""
+    a = re.sub(r"\s+", "", a)
+    b = re.sub(r"\s+", "", b)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def merge_by_text(frame_paths, texts, threshold: float):
+    """Drop a frame when its main content (OCR text) is nearly identical to the
+    previously kept frame's. Implements "same main content => duplicate"."""
+    if threshold <= 0 or len(frame_paths) < 2:
+        return frame_paths, texts
+    kept_frames, kept_texts, last = [], [], None
+    for f, t in zip(frame_paths, texts):
+        if last is not None and text_similarity(t, last) >= threshold:
+            continue
+        kept_frames.append(f)
+        kept_texts.append(t)
+        last = t
+    return kept_frames, kept_texts
 
 
 def paddle_major() -> int:
@@ -156,33 +195,66 @@ def paddle_ocr():
     return ocr
 
 
-def ocr_text_paddle(path: Path) -> str:
+def _filter_ocr_lines(path: Path, rows, min_height=0.0, text_top=0.0, text_bottom=0.0) -> list:
+    """Keep only the frame's main-content text:
+    - drop lines smaller than min_height fraction of frame height
+    - drop lines whose box center sits in the top/bottom overlay strips
+      (title bars, ribbon, taskbar, watermarks), defined by text_top/text_bottom
+      fractions of height."""
+    img_h = Image.open(path).height
+    out = []
+    for t, box in rows:
+        ys = [p[1] for p in box]
+        cy = (max(ys) + min(ys)) / 2 / img_h
+        bh = (max(ys) - min(ys)) / img_h
+        if text_top and cy < text_top:
+            continue
+        if text_bottom and cy > 1 - text_bottom:
+            continue
+        if min_height and bh < min_height:
+            continue
+        out.append(t)
+    return out
+
+
+def ocr_text_paddle(path: Path, min_height: float = 0.0,
+                    text_top: float = 0.0, text_bottom: float = 0.0) -> str:
     ocr = paddle_ocr()
     if paddle_major() >= 3:
         texts = []
         for res in ocr.predict(str(path)):
-            rec = getattr(res, "rec_texts", None) or res.get("rec_texts", [])
-            texts.extend(rec or [])
+            rec = getattr(res, "rec_texts", None) or res.get("rec_texts", []) or []
+            boxes = getattr(res, "rec_boxes", None) or res.get("rec_boxes", None)
+            if boxes is not None:
+                rows = []
+                for i, t in enumerate(rec):
+                    b = np.asarray(boxes[i])
+                    pts = b.reshape(-1, 2).tolist() if b.size else [[0, 0]]
+                    rows.append((t, pts))
+                texts.extend(_filter_ocr_lines(path, rows, min_height, text_top, text_bottom))
+            else:
+                texts.extend(rec)
         return "\n".join(texts)
 
     result = ocr.ocr(str(path), cls=True)
-    texts = []
-    if result and result[0]:
-        for line in result[0]:
-            texts.append(line[1][0])
-    return "\n".join(texts)
+    if not result or not result[0]:
+        return ""
+    rows = [(line[1][0], line[0]) for line in result[0]]
+    return "\n".join(_filter_ocr_lines(path, rows, min_height, text_top, text_bottom))
 
 
-def ocr_text(path: Path, engine: str) -> str:
+def ocr_text(path: Path, engine: str, min_height: float = 0.0,
+             text_top: float = 0.0, text_bottom: float = 0.0) -> str:
     if engine == "paddleocr":
-        return ocr_text_paddle(path)
+        return ocr_text_paddle(path, min_height, text_top, text_bottom)
 
     import easyocr
     reader = getattr(ocr_text, "_easyocr", None)
     if reader is None:
         reader = easyocr.Reader(["ch_sim", "en"])
         ocr_text._easyocr = reader
-    return "\n".join(txt for (_, txt, _) in reader.readtext(str(path)))
+    rows = [(txt, box) for box, txt, _ in reader.readtext(str(path))]
+    return "\n".join(_filter_ocr_lines(path, rows, min_height, text_top, text_bottom))
 
 
 def build_pptx(frame_paths, texts, output: Path, size=(13.333, 7.5)):
@@ -215,6 +287,25 @@ def main():
                         help="Perceptual-hash similarity threshold (0-1)")
     parser.add_argument("--ocr", choices=["paddleocr", "easyocr"], default="paddleocr")
     parser.add_argument("--keep-frames", action="store_true")
+    parser.add_argument("--crop-top", type=float, default=0.0,
+                        help="Fraction of height to ignore at top (title bars etc.)")
+    parser.add_argument("--crop-bottom", type=float, default=0.0,
+                        help="Fraction of height to ignore at bottom (taskbar/player bar)")
+    parser.add_argument("--crop-left", type=float, default=0.0,
+                        help="Fraction of width to ignore at left")
+    parser.add_argument("--crop-right", type=float, default=0.0,
+                        help="Fraction of width to ignore at right")
+    parser.add_argument("--text-similarity", type=float, default=0.0,
+                        help="Merge slides whose OCR text similarity >= this (0 disables)")
+    parser.add_argument("--min-text-height", type=float, default=0.02,
+                        help="Drop OCR lines smaller than this fraction of frame "
+                             "height (removes UI/overlay text; 0 keeps all)")
+    parser.add_argument("--text-top", type=float, default=0.0,
+                        help="Fraction of height to ignore at top when keeping OCR "
+                             "text (ribbon / title bar overlay removal)")
+    parser.add_argument("--text-bottom", type=float, default=0.0,
+                        help="Fraction of height to ignore at bottom when keeping OCR "
+                             "text (taskbar / watermark overlay removal)")
     args = parser.parse_args()
 
     if not args.input_video.exists():
@@ -226,11 +317,21 @@ def main():
         print(f"Extracting frames every {args.interval}s...")
         frames = extract_frames(args.input_video, frames_dir, args.interval)
 
-        print(f"Deduplicating {len(frames)} frames (threshold={args.similarity})...")
-        unique = deduplicate(frames, args.similarity)
+        crop = (args.crop_top, args.crop_bottom, args.crop_left, args.crop_right)
+        crop = crop if any(crop) else None
 
-        print(f"OCR {len(unique)} unique frames with {args.ocr}...")
-        texts = [ocr_text(f, args.ocr) for f in unique]
+        print(f"Deduplicating {len(frames)} frames (threshold={args.similarity}, crop={crop})...")
+        unique = deduplicate(frames, args.similarity, crop=crop)
+
+        print(f"OCR {len(unique)} unique frames with {args.ocr} "
+              f"(min-text-height={args.min_text_height}, "
+              f"text-top={args.text_top}, text-bottom={args.text_bottom})...")
+        texts = [ocr_text(f, args.ocr, args.min_text_height, args.text_top, args.text_bottom) for f in unique]
+
+        if args.text_similarity > 0:
+            before = len(unique)
+            unique, texts = merge_by_text(unique, texts, args.text_similarity)
+            print(f"Text dedup: {before} -> {len(unique)} (similarity>={args.text_similarity})")
 
         build_pptx(unique, texts, args.output_pptx)
 
@@ -260,12 +361,18 @@ python ~/.claude/scripts/video_to_pptx.py input.mp4 output.pptx --interval 2 --s
 - `--similarity`: 感知哈希相似度阈值（默认 0.92），越高越严格
 - `--ocr`: `paddleocr` 或 `easyocr`
 - `--keep-frames`: 保留中间抽帧目录
+- `--crop-top/--crop-bottom/--crop-left/--crop-right`: 去重时按图像高度/宽度比例忽略边缘区域（遮盖去除），用于排除标题栏、任务栏、播放器控件等非主要内容（默认 0）
+- `--text-similarity`: 文字去重阈值（默认 0 关闭）。OCR 后若某页文字与上一保留页相似度 ≥ 该值则视为“主要内容相同”合并（如 0.9）
+- `--min-text-height`: 过滤小于该帧高比例的 OCR 文字（默认 0.02），去除小号“文字遮盖”（0 保留全部）
+- `--text-top/--text-bottom`: 按垂直位置过滤 OCR 文字——忽略顶部/底部这些比例的“遮盖”区域（标题栏、功能区、任务栏、水印），只保留中间主要内容文字（默认 0）
 
 ## Tuning notes
 
 - 重复页过多 → 提高 `--similarity`（如 0.95）
 - 真实翻页被合并 → 降低 `--similarity`（如 0.88）或减小 `--interval`
 - 动画、转场、摄像头人像可能导致误判，可先用 `--interval 5` 粗跑观察
+- 屏幕录制有固定遮盖（任务栏/标题栏/水印）→ 用 `--crop-top/--crop-bottom` 按比例裁掉后再判断重复
+- 内容几乎不变只是光标/小元素移动 → 用 `--text-similarity 0.9` 按 OCR 文字合并“主要内容相同”的页
 
 ## Troubleshooting
 
