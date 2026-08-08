@@ -31,22 +31,41 @@ python scripts/video_to_pptx.py input.mp4 output.pptx --interval 10 --similarity
 |------|---------|------|
 | `--interval` | 10 | seconds between frame captures |
 | `--sample-similarity` | 0.5 | capture gate: skip a frame whose hash similarity to the previous captured frame is above this (0 disables) |
-| `--region-grid` | 8 | divide frames into grid x grid regions (8 -> 64) for adjacent-frame dedup |
-| `--region-similarity` | 0.5 | per-region hash similarity above which a region counts as "the same" |
-| `--region-ratio` | 0.8 | drop a frame when more than this fraction of its regions match the previous kept frame (0 disables) |
-| `--similarity` | 0.92 | global perceptual hash threshold; raise to keep fewer similar frames |
+| `--content-select` | on | group frames by their underlying/base page, keep the most text-complete / image-complete frame per page (see below) |
+| `--base-sim` | 0.96 | pixel similarity above which two frames count as the same underlying page |
+| `--overlay-thresh` | 0.08 | pixel difference (fraction of 255) beyond which a cell counts as overlaid/color-changed vs the group base |
+| `--image-weight` | 0.5 | how strongly image completeness (no overlay/color-change) counts when picking the representative, besides text completeness |
+| `--region-grid` | 8 | (only with `--no-content-select`) divide frames into grid x grid regions for adjacent-frame dedup |
+| `--region-similarity` | 0.5 | (only with `--no-content-select`) per-region hash similarity above which a region counts as "the same" |
+| `--region-ratio` | 0.8 | (only with `--no-content-select`) drop a frame when more than this fraction of its regions match the previous kept frame (0 disables) |
+| `--similarity` | 0.92 | (only with `--no-content-select`) global perceptual hash threshold; raise to keep fewer similar frames |
 | `--ocr` | paddleocr | `paddleocr` or `easyocr` |
 | `--keep-frames` | off | keep extracted frame images |
-| `--crop-top/bottom/left/right` | 0 | fractions of the frame to ignore during dedup (overlay removal: title bars, taskbar, player controls) |
+| `--crop-top/bottom/left/right` | 0 | fractions of the frame to ignore during image dedup (overlay removal: title bars, taskbar, player controls) |
 | `--text-similarity` | 0 (off) | merge slides whose OCR text similarity ≥ this; "same main content => duplicate" |
 | `--min-text-height` | 0.02 | drop OCR lines smaller than this fraction of frame height (removes menus / title bars / watermark text); 0 keeps all |
 | `--text-top` / `--text-bottom` | 0 | ignore these fractions of frame height at top/bottom when keeping OCR text (ribbon / taskbar / watermark overlay removal) |
 
+## How content selection works (default)
+
+1. Extract a frame every `--interval` seconds; skip frames whose hash similarity
+   to the previous captured frame is above `--sample-similarity`.
+2. OCR every remaining frame.
+3. Group frames whose underlying page is the same: two frames are in the same
+   group when their full-frame pixel similarity is ≥ `--base-sim`.
+4. Per group, keep the single frame with the most complete text *or* the most
+   complete image (least overlaid / least color-changed), scored as
+   `text_len / max_text_len + --image-weight * (1 - deviation)`.
+
+This keeps one clean representative per distinct screen and drops intermediate
+states, popups, and highlight/selection frames. Pass `--no-content-select` to
+fall back to the older region + global perceptual-hash dedup.
+
 ## Tuning
 
-- Too many duplicate slides → raise `--similarity` to 0.95+
-- Too few slides on a very static screen recording → raise `--region-ratio` (e.g. 0.9) so only near-identical frames are merged; 0.4 is aggressive
-- Missing slides → lower `--similarity` to 0.85–0.88 or reduce `--interval`
+- Too many pages → raise `--base-sim` (e.g. 0.97); too few → lower it (0.94)
+- Representative looks overlaid/color-changed → raise `--image-weight` or lower `--overlay-thresh`
+- Missing slides → lower `--similarity` / `--base-sim` or reduce `--interval`
 - Animated transitions / camera movement → use `--interval 5` first to preview
 - Screen recordings with fixed overlays (taskbar / title bars / watermark) → pass `--crop-top` / `--crop-bottom` to ignore those strips when judging duplicates
 - Slides that differ only by cursor movement or tiny UI changes → enable `--text-similarity 0.9` to merge pages whose main content (OCR text) is the same

@@ -156,6 +156,83 @@ def region_dedup(frame_paths, grid: int, region_sim: float, region_ratio: float,
     return kept
 
 
+def select_content_pages(frame_paths, texts, base_sim: float = 0.96, grid: int = 8,
+                         dev_thresh: float = 0.08, image_weight: float = 0.5):
+    """Keep one representative per underlying page.
+
+    Rule (user-specified): when frames share the same underlying/base page,
+    keep the frame whose text is the most complete OR whose image is the most
+    complete (least covered by overlays / least color-changed) as the
+    representative; drop frames that clearly have overlaying parts or color
+    changes (large local deviation from the group's typical appearance).
+
+    Frames are grouped with union-find over pixel similarity >= `base_sim`
+    (0.96 = effectively the same screen), then within each group the frame
+    maximizing
+        text_len / max_text_len  +  image_weight * (1 - deviation)
+    wins, where deviation is the fraction of grid cells that differ strongly
+    from the group's median appearance (overlay / color-change signal).
+    """
+    n = len(frame_paths)
+    if n <= 1:
+        return list(frame_paths), list(texts)
+
+    # Downscaled grayscale for fast pixel comparison.
+    smalls = [
+        np.asarray(Image.open(p).convert("L").resize((128, 72)), dtype=np.float32)
+        for p in frame_paths
+    ]
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim = 1 - np.abs(smalls[i] - smalls[j]).mean() / 255.0
+            if sim >= base_sim:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    def deviation(arr, base):
+        """Fraction of grid cells differing strongly from the group base."""
+        diff = np.abs(arr - base) > dev_thresh * 255.0
+        h, w = diff.shape
+        gh, gw = h // grid, w // grid
+        cells = 0
+        for r in range(grid):
+            for c in range(grid):
+                if diff[r * gh:(r + 1) * gh, c * gw:(c + 1) * gw].mean() > 0.10:
+                    cells += 1
+        return cells / (grid * grid)
+
+    kept, kept_texts = [], []
+    for g in groups.values():
+        if len(g) == 1:
+            kept.append(frame_paths[g[0]])
+            kept_texts.append(texts[g[0]])
+            continue
+        base = np.median(np.stack([smalls[i] for i in g]), axis=0)
+        maxlen = max(len(texts[i]) for i in g)
+        best, best_score = None, None
+        for i in g:
+            score = (len(texts[i]) / maxlen) + image_weight * (1.0 - deviation(smalls[i], base))
+            if best is None or score > best_score:
+                best, best_score = i, score
+        kept.append(frame_paths[best])
+        kept_texts.append(texts[best])
+    return kept, kept_texts
+
+
 def text_similarity(a: str, b: str) -> float:
     """0-1 similarity of two OCR text blocks, whitespace-insensitive."""
     a = re.sub(r"\s+", "", a)
@@ -315,6 +392,22 @@ def main():
     parser.add_argument("--region-ratio", type=float, default=0.8,
                         help="Drop a frame when more than this fraction of its regions "
                              "match the previous kept frame (0 disables region dedup)")
+    parser.add_argument("--content-select", action="store_true", default=True,
+                        help="Group frames by their underlying/base page and keep the "
+                             "most text-complete, clean frame per page (default)")
+    parser.add_argument("--no-content-select", dest="content_select", action="store_false",
+                        help="Disable content selection (use region dedup + global hash "
+                             "dedup instead)")
+    parser.add_argument("--base-sim", type=float, default=0.96,
+                        help="Pixel similarity above which two frames are treated as "
+                             "the same underlying/base page")
+    parser.add_argument("--overlay-thresh", type=float, default=0.08,
+                        help="Pixel difference (fraction of 255) beyond which a cell "
+                             "counts as overlaid/color-changed vs the group base")
+    parser.add_argument("--image-weight", type=float, default=0.5,
+                        help="How strongly image completeness (no overlay/color-change "
+                             "vs the group base) counts when picking the representative, "
+                             "besides text completeness")
     parser.add_argument("--ocr", choices=["paddleocr", "easyocr"], default="paddleocr")
     parser.add_argument("--keep-frames", action="store_true")
     parser.add_argument("--crop-top", type=float, default=0.0,
@@ -356,21 +449,38 @@ def main():
             print(f"Capture gate: {before} -> {len(frames)} "
                   f"(sim > {args.sample_similarity} to previous frame skipped)")
 
-        if args.region_ratio > 0:
+        if args.content_select:
+            # Content selection: OCR every gated frame, group by underlying page,
+            # keep the most text-complete, clean frame per page.
+            print(f"OCR {len(frames)} gated frames with {args.ocr} "
+                  f"(min-text-height={args.min_text_height}, "
+                  f"text-top={args.text_top}, text-bottom={args.text_bottom})...")
+            texts = [ocr_text(f, args.ocr, args.min_text_height,
+                              args.text_top, args.text_bottom) for f in frames]
             before = len(frames)
-            frames = region_dedup(frames, args.region_grid, args.region_similarity,
-                                  args.region_ratio, crop=crop)
-            print(f"Region dedup: {before} -> {len(frames)} "
-                  f"({args.region_grid}x{args.region_grid} grid, "
-                  f"region sim > {args.region_similarity}, ratio > {args.region_ratio})")
+            unique, texts = select_content_pages(
+                frames, texts, base_sim=args.base_sim,
+                dev_thresh=args.overlay_thresh, image_weight=args.image_weight)
+            print(f"Content select: {before} -> {len(unique)} pages "
+                  f"(base-sim>={args.base_sim})")
+        else:
+            if args.region_ratio > 0:
+                before = len(frames)
+                frames = region_dedup(frames, args.region_grid, args.region_similarity,
+                                      args.region_ratio, crop=crop)
+                print(f"Region dedup: {before} -> {len(frames)} "
+                      f"({args.region_grid}x{args.region_grid} grid, "
+                      f"region sim > {args.region_similarity}, ratio > {args.region_ratio})")
 
-        print(f"Deduplicating {len(frames)} frames (threshold={args.similarity}, crop={crop})...")
-        unique = deduplicate(frames, args.similarity, crop=crop)
+            print(f"Deduplicating {len(frames)} frames "
+                  f"(threshold={args.similarity}, crop={crop})...")
+            unique = deduplicate(frames, args.similarity, crop=crop)
 
-        print(f"OCR {len(unique)} unique frames with {args.ocr} "
-              f"(min-text-height={args.min_text_height}, "
-              f"text-top={args.text_top}, text-bottom={args.text_bottom})...")
-        texts = [ocr_text(f, args.ocr, args.min_text_height, args.text_top, args.text_bottom) for f in unique]
+            print(f"OCR {len(unique)} unique frames with {args.ocr} "
+                  f"(min-text-height={args.min_text_height}, "
+                  f"text-top={args.text_top}, text-bottom={args.text_bottom})...")
+            texts = [ocr_text(f, args.ocr, args.min_text_height,
+                              args.text_top, args.text_bottom) for f in unique]
 
         if args.text_similarity > 0:
             before = len(unique)
