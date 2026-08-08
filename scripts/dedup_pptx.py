@@ -2,20 +2,24 @@
 """
 dedup_pptx.py
 Merge duplicate slides in an existing .pptx deck without touching the source
-video. Slides are compared by the perceptual hash of their embedded frame
-image; a slide is dropped when its image (optionally cropped to the main
-content region) is nearly identical to the previously kept slide's.
+video. Two signals, either one of which drops a slide (compared against the
+previously kept slide):
 
-Optional text-based pass: a slide may also be dropped when its notes text is
-nearly identical to the previous kept slide's (--text-similarity).
+1. Image: perceptual hash of the slide's embedded frame image, optionally
+   cropped to the main content region (--crop-*) to ignore overlay strips
+   such as title bars, side panels, taskbars or watermarks.
+2. Text: OCR the slide image, keep only text inside the main content region
+   (--region-top/bottom/right, --min-text-height, --min-conf), and drop the
+   slide when most of the text is the same (--text-similarity, e.g. 0.50).
 
 Usage:
   python scripts/dedup_pptx.py input.pptx output.pptx \
-      --image-similarity 0.95 --crop-top 0.15 --crop-bottom 0.08
+      --image-similarity 0.95 --text-similarity 0.5 \
+      --crop-top 0.15 --crop-bottom 0.08 --crop-right 0.10 \
+      --region-top 0.15 --region-bottom 0.92 --region-right 0.90
 """
 import argparse
 import hashlib
-import re
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -42,20 +46,63 @@ def image_hash_pil(img: Image.Image, size: int = 16, crop=None) -> str:
     return hashlib.sha1(bits.tobytes()).hexdigest()
 
 
+_ocr_reader = None
+
+
+def ocr_content_text(img: Image.Image, region_top, region_bottom, region_right,
+                     min_height, min_conf) -> str:
+    """OCR one slide image and return only the text inside the main content
+    region (the overlay strips — ribbon, side panel, taskbar — are excluded)."""
+    global _ocr_reader
+    if _ocr_reader is None:
+        import easyocr
+        _ocr_reader = easyocr.Reader(["ch_sim", "en"])
+    W, H = img.size
+    arr = np.array(img)
+    lines = []
+    for box, txt, conf in _ocr_reader.readtext(arr):
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        cx = (max(xs) + min(xs)) / 2 / W
+        cy = (max(ys) + min(ys)) / 2 / H
+        bh = (max(ys) - min(ys)) / H
+        if cx > region_right:
+            continue
+        if cy < region_top or cy > region_bottom:
+            continue
+        if bh < min_height:
+            continue
+        if conf < min_conf:
+            continue
+        lines.append(txt)
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Deduplicate an existing pptx")
     parser.add_argument("input_pptx", type=Path)
     parser.add_argument("output_pptx", type=Path)
     parser.add_argument("--image-similarity", type=float, default=0.95,
-                        help="Drop a slide when its frame-image hash similarity to "
-                             "the previous kept slide is >= this (0 disables)")
+                        help="Drop a slide when its frame-image hash similarity to the "
+                             "previous kept slide is >= this (0 disables)")
     parser.add_argument("--crop-top", type=float, default=0.0)
     parser.add_argument("--crop-bottom", type=float, default=0.0)
     parser.add_argument("--crop-left", type=float, default=0.0)
     parser.add_argument("--crop-right", type=float, default=0.0)
-    parser.add_argument("--text-similarity", type=float, default=0.0,
-                        help="Additionally drop a slide when its notes text "
-                             "similarity to the previous kept slide is >= this (0 disables)")
+    parser.add_argument("--text-similarity", type=float, default=0.5,
+                        help="Drop a slide when most of its OCR text is the same as the "
+                             "previous kept slide's (similarity >= this, e.g. 0.50); "
+                             "0 disables the OCR pass")
+    parser.add_argument("--region-top", type=float, default=0.15,
+                        help="Ignore OCR text above this fraction of height (ribbon/title bar)")
+    parser.add_argument("--region-bottom", type=float, default=0.92,
+                        help="Ignore OCR text below this fraction of height (taskbar)")
+    parser.add_argument("--region-right", type=float, default=0.90,
+                        help="Ignore OCR text right of this fraction of width (side panel)")
+    parser.add_argument("--min-text-height", type=float, default=0.01,
+                        help="Ignore OCR lines smaller than this fraction of height")
+    parser.add_argument("--min-conf", type=float, default=0.3,
+                        help="Ignore OCR lines with confidence below this")
     args = parser.parse_args()
 
     crop = (args.crop_top, args.crop_bottom, args.crop_left, args.crop_right)
@@ -64,7 +111,6 @@ def main():
     src = Presentation(str(args.input_pptx))
     total = len(src.slides)
 
-    # Collect each slide's frame image + notes.
     slides = []
     for s in src.slides:
         img = None
@@ -75,23 +121,25 @@ def main():
         notes = s.notes_slide.notes_text_frame.text if s.has_notes_slide else ""
         slides.append({"image": img, "notes": notes})
 
-    keep_idx, last_hash, last_notes = [], None, None
+    keep_idx, last_hash, last_text = [], None, None
     for i, sl in enumerate(slides):
         drop = False
         if args.image_similarity > 0 and sl["image"] is not None and last_hash is not None:
             h = image_hash_pil(sl["image"], crop=crop)
             if hash_similarity(h, last_hash) >= args.image_similarity:
                 drop = True
-        if not drop and args.text_similarity > 0 and last_notes is not None:
-            if text_similarity(sl["notes"], last_notes) >= args.text_similarity:
+        if not drop and args.text_similarity > 0 and sl["image"] is not None:
+            txt = ocr_content_text(sl["image"], args.region_top, args.region_bottom,
+                                   args.region_right, args.min_text_height, args.min_conf)
+            if last_text is not None and text_similarity(txt, last_text) >= args.text_similarity:
                 drop = True
+            if not drop:
+                last_text = txt
         if drop:
             continue
         keep_idx.append(i)
         if args.image_similarity > 0 and sl["image"] is not None:
             last_hash = image_hash_pil(sl["image"], crop=crop)
-        if args.text_similarity > 0:
-            last_notes = sl["notes"]
 
     out = Presentation()
     out.slide_width = src.slide_width
@@ -112,7 +160,9 @@ def main():
     out.save(str(args.output_pptx))
     print(f"{total} slides -> {len(keep_idx)} slides "
           f"(image-similarity={args.image_similarity}, crop={crop}, "
-          f"text-similarity={args.text_similarity})")
+          f"text-similarity={args.text_similarity}, "
+          f"region=(top={args.region_top}, bottom={args.region_bottom}, "
+          f"right={args.region_right}))")
     print(f"Saved {args.output_pptx}")
 
 

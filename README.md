@@ -55,14 +55,24 @@ image with a perceptual hash, using `--crop-*` to ignore overlay strips:
 
 ```bash
 python scripts/dedup_pptx.py input.pptx output.pptx \
-    --image-similarity 0.95 --crop-top 0.15 --crop-bottom 0.08
+    --image-similarity 0.95 --text-similarity 0.5 \
+    --crop-top 0.15 --crop-bottom 0.08 --crop-right 0.10 \
+    --region-top 0.15 --region-bottom 0.92 --region-right 0.90
 ```
 
 | flag | default | note |
 |------|---------|------|
 | `--image-similarity` | 0.95 | drop a slide when its frame-image hash similarity to the previous kept slide is ≥ this (0 disables) |
-| `--crop-top/bottom/left/right` | 0 | ignore these frame-edge fractions before comparing images |
-| `--text-similarity` | 0 (off) | additionally drop a slide when its notes text is ≥ this similar to the previous kept slide |
+| `--crop-top/bottom/left/right` | 0 | ignore these frame-edge fractions before comparing images (title bar / taskbar / side panel) |
+| `--text-similarity` | 0.5 | drop a slide when most of its OCR text is the same as the previous kept slide's (≥ this); 0 disables the OCR pass |
+| `--region-top/bottom/right` | 0.15/0.92/0.90 | ignore OCR text outside the main content region (ribbon / taskbar / side panel) |
+| `--min-text-height` | 0.01 | ignore OCR lines smaller than this fraction of frame height |
+| `--min-conf` | 0.3 | ignore OCR lines with confidence below this |
+
+A slide is dropped when *either* the image hash is ≥ `--image-similarity` (same
+screen after ignoring overlay strips) *or* most of its main-content text is ≥
+`--text-similarity` (same content shown slightly differently). The OCR pass
+requires `easyocr`.
 
 ## Install as Claude Code skill
 
