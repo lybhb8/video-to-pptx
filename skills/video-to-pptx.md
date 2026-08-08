@@ -1,6 +1,6 @@
 ---
 name: video-to-pptx
-version: 1.0.0
+version: 1.1.0
 description: Convert video courseware/lectures into a PowerPoint (.pptx) by extracting frames with ffmpeg, OCR with PaddleOCR/easyocr, deduplicating similar frames, and building slides with python-pptx.
 trigger: |
   把视频转成 PPT
@@ -123,19 +123,59 @@ def deduplicate(frame_paths, threshold: float):
     return kept
 
 
+def paddle_major() -> int:
+    """Return installed paddleocr major version (default 2 if undetectable)."""
+    try:
+        from importlib.metadata import version
+        return int(version("paddleocr").split(".")[0])
+    except Exception:
+        return 2
+
+
+def paddle_ocr():
+    """Build a cached PaddleOCR instance matching the installed API version."""
+    from paddleocr import PaddleOCR
+    ocr = getattr(paddle_ocr, "_inst", None)
+    if ocr is None:
+        if paddle_major() >= 3:
+            # PaddleOCR 3.x: ocr()/use_angle_cls are deprecated; use predict().
+            # Disable orientation/doc-unwarp preprocessing to speed up slide OCR.
+            try:
+                ocr = PaddleOCR(
+                    lang="ch",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                )
+            except (TypeError, ValueError):
+                ocr = PaddleOCR(lang="ch")
+        else:
+            # PaddleOCR 2.x legacy API.
+            ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+        paddle_ocr._inst = ocr
+    return ocr
+
+
+def ocr_text_paddle(path: Path) -> str:
+    ocr = paddle_ocr()
+    if paddle_major() >= 3:
+        texts = []
+        for res in ocr.predict(str(path)):
+            rec = getattr(res, "rec_texts", None) or res.get("rec_texts", [])
+            texts.extend(rec or [])
+        return "\n".join(texts)
+
+    result = ocr.ocr(str(path), cls=True)
+    texts = []
+    if result and result[0]:
+        for line in result[0]:
+            texts.append(line[1][0])
+    return "\n".join(texts)
+
+
 def ocr_text(path: Path, engine: str) -> str:
     if engine == "paddleocr":
-        from paddleocr import PaddleOCR
-        ocr = getattr(ocr_text, "_paddle", None)
-        if ocr is None:
-            ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
-            ocr_text._paddle = ocr
-        result = ocr.ocr(str(path), cls=True)
-        texts = []
-        if result and result[0]:
-            for line in result[0]:
-                texts.append(line[1][0])
-        return "\n".join(texts)
+        return ocr_text_paddle(path)
 
     import easyocr
     reader = getattr(ocr_text, "_easyocr", None)

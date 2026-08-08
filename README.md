@@ -14,6 +14,8 @@ pip install python-pptx opencv-python pillow numpy paddlepaddle paddleocr
 pip install easyocr
 ```
 
+The OCR layer auto-detects the installed PaddleOCR major version (2.x `ocr()` vs 3.x `predict()`), so either works.
+
 Also install ffmpeg:
 - Windows: `winget install Gyan.FFmpeg`
 - macOS: `brew install ffmpeg`
