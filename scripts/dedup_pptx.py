@@ -20,6 +20,7 @@ Usage:
 """
 import argparse
 import hashlib
+import json
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -78,6 +79,30 @@ def ocr_content_text(img: Image.Image, region_top, region_bottom, region_right,
     return "\n".join(lines)
 
 
+def load_or_ocr(slides, args, cache_path) -> list:
+    """Return per-slide main-content OCR text, reusing a JSON cache keyed by the
+    input deck so changing thresholds does not re-OCR."""
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if len(data) == len(slides):
+                print(f"OCR cache hit: {cache_path}")
+                return data
+        except Exception:
+            pass
+    texts = []
+    for sl in slides:
+        if sl["image"] is None:
+            texts.append("")
+            continue
+        texts.append(ocr_content_text(sl["image"], args.region_top, args.region_bottom,
+                                      args.region_right, args.min_text_height,
+                                      args.min_conf))
+    cache_path.write_text(json.dumps(texts, ensure_ascii=False), encoding="utf-8")
+    print(f"OCR done ({len(texts)} slides), cache saved: {cache_path}")
+    return texts
+
+
 def main():
     parser = argparse.ArgumentParser(description="Deduplicate an existing pptx")
     parser.add_argument("input_pptx", type=Path)
@@ -121,6 +146,12 @@ def main():
         notes = s.notes_slide.notes_text_frame.text if s.has_notes_slide else ""
         slides.append({"image": img, "notes": notes})
 
+    if args.text_similarity > 0:
+        cache_path = args.input_pptx.with_name(args.input_pptx.stem + ".ocr.json")
+        content_texts = load_or_ocr(slides, args, cache_path)
+    else:
+        content_texts = None
+
     keep_idx, last_hash, last_text = [], None, None
     for i, sl in enumerate(slides):
         drop = False
@@ -128,13 +159,11 @@ def main():
             h = image_hash_pil(sl["image"], crop=crop)
             if hash_similarity(h, last_hash) >= args.image_similarity:
                 drop = True
-        if not drop and args.text_similarity > 0 and sl["image"] is not None:
-            txt = ocr_content_text(sl["image"], args.region_top, args.region_bottom,
-                                   args.region_right, args.min_text_height, args.min_conf)
-            if last_text is not None and text_similarity(txt, last_text) >= args.text_similarity:
+        if not drop and args.text_similarity > 0 and last_text is not None:
+            if text_similarity(content_texts[i], last_text) >= args.text_similarity:
                 drop = True
             if not drop:
-                last_text = txt
+                last_text = content_texts[i]
         if drop:
             continue
         keep_idx.append(i)
