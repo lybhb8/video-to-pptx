@@ -1,5 +1,7 @@
 # video-to-pptx
 
+[English](README.md) | [中文](README.zh-CN.md)
+
 Convert video courseware/lectures into `.pptx` slides.
 
 ```
