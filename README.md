@@ -24,13 +24,17 @@ Also install ffmpeg:
 ## Usage
 
 ```bash
-python scripts/video_to_pptx.py input.mp4 output.pptx --interval 2 --similarity 0.92
+python scripts/video_to_pptx.py input.mp4 output.pptx --interval 10 --similarity 0.92
 ```
 
 | flag | default | note |
 |------|---------|------|
-| `--interval` | 2 | seconds between frame captures |
-| `--similarity` | 0.92 | perceptual hash threshold; raise to keep fewer similar frames |
+| `--interval` | 10 | seconds between frame captures |
+| `--sample-similarity` | 0.5 | capture gate: skip a frame whose hash similarity to the previous captured frame is above this (0 disables) |
+| `--region-grid` | 8 | divide frames into grid x grid regions (8 -> 64) for adjacent-frame dedup |
+| `--region-similarity` | 0.5 | per-region hash similarity above which a region counts as "the same" |
+| `--region-ratio` | 0.8 | drop a frame when more than this fraction of its regions match the previous kept frame (0 disables) |
+| `--similarity` | 0.92 | global perceptual hash threshold; raise to keep fewer similar frames |
 | `--ocr` | paddleocr | `paddleocr` or `easyocr` |
 | `--keep-frames` | off | keep extracted frame images |
 | `--crop-top/bottom/left/right` | 0 | fractions of the frame to ignore during dedup (overlay removal: title bars, taskbar, player controls) |
@@ -41,6 +45,7 @@ python scripts/video_to_pptx.py input.mp4 output.pptx --interval 2 --similarity 
 ## Tuning
 
 - Too many duplicate slides → raise `--similarity` to 0.95+
+- Too few slides on a very static screen recording → raise `--region-ratio` (e.g. 0.9) so only near-identical frames are merged; 0.4 is aggressive
 - Missing slides → lower `--similarity` to 0.85–0.88 or reduce `--interval`
 - Animated transitions / camera movement → use `--interval 5` first to preview
 - Screen recordings with fixed overlays (taskbar / title bars / watermark) → pass `--crop-top` / `--crop-bottom` to ignore those strips when judging duplicates
