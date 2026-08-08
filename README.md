@@ -46,6 +46,24 @@ python scripts/video_to_pptx.py input.mp4 output.pptx --interval 2 --similarity 
 - Screen recordings with fixed overlays (taskbar / title bars / watermark) → pass `--crop-top` / `--crop-bottom` to ignore those strips when judging duplicates
 - Slides that differ only by cursor movement or tiny UI changes → enable `--text-similarity 0.9` to merge pages whose main content (OCR text) is the same
 
+## Deduplicate an existing pptx (no re-OCRing)
+
+If you already generated a deck and want to drop slides whose main content is the
+same (ignoring overlays such as title bars / taskbars / watermarks), run the
+post-processor directly on the pptx — it compares each slide's embedded frame
+image with a perceptual hash, using `--crop-*` to ignore overlay strips:
+
+```bash
+python scripts/dedup_pptx.py input.pptx output.pptx \
+    --image-similarity 0.95 --crop-top 0.15 --crop-bottom 0.08
+```
+
+| flag | default | note |
+|------|---------|------|
+| `--image-similarity` | 0.95 | drop a slide when its frame-image hash similarity to the previous kept slide is ≥ this (0 disables) |
+| `--crop-top/bottom/left/right` | 0 | ignore these frame-edge fractions before comparing images |
+| `--text-similarity` | 0 (off) | additionally drop a slide when its notes text is ≥ this similar to the previous kept slide |
+
 ## Install as Claude Code skill
 
 ```bash
