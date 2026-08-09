@@ -107,3 +107,7 @@ mkdir -p ~/.claude/skills ~/.claude/scripts
 cp skills/video-to-pptx.md ~/.claude/skills/
 cp scripts/video_to_pptx.py ~/.claude/scripts/
 ```
+
+## License
+
+[GNU General Public License v3.0](LICENSE) — see the [LICENSE](LICENSE) file.

@@ -99,3 +99,7 @@ mkdir -p ~/.claude/skills ~/.claude/scripts
 cp skills/video-to-pptx.md ~/.claude/skills/
 cp scripts/video_to_pptx.py ~/.claude/scripts/
 ```
+
+## License
+
+[GNU 通用公共许可证 v3.0](LICENSE) —— 详见 [LICENSE](LICENSE) 文件。
